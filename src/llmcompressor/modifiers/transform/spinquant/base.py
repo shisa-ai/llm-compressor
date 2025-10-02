@@ -158,6 +158,7 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
     _stored_rotation_tensors: Dict[str, torch.Tensor] = PrivateAttr(
         default_factory=dict
     )
+    _offload_restore: Dict[int, bool] = PrivateAttr(default_factory=dict)
 
     @field_validator("randomize", mode="before")
     def validate_not_implemented(cls, value, info: ValidationInfo):
@@ -388,6 +389,8 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
     def _apply_transforms(self, model: PreTrainedModel) -> None:
         if self.transform_config is None:
             return
+        if self.learn_rotations:
+            self._temporarily_disable_offload(model)
         self._prepare_rotation_keys(model)
         apply_transform_config(model, self.transform_config)
         self._attach_online_rotations(model)
@@ -590,6 +593,7 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         self._rotation_params.clear()
         self._parent_modules.clear()
         self._rotation_lookup.clear()
+        self._restore_offload(model)
 
     def _apply_cayley_updates(self) -> None:
         lr = self.cayley_lr
@@ -628,6 +632,24 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
                 key: torch.tensor(value, dtype=dtype)
                 for key, value in stored.items()
             }
+
+    def _temporarily_disable_offload(self, model: PreTrainedModel) -> None:
+        self._offload_restore.clear()
+        for module in model.modules():
+            hook = getattr(module, "_hf_hook", None)
+            if hook is not None and getattr(hook, "offload", False):
+                self._offload_restore[id(module)] = True
+                hook.offload = False
+
+    def _restore_offload(self, model: PreTrainedModel) -> None:
+        if not self._offload_restore:
+            return
+        for module in model.modules():
+            if id(module) in self._offload_restore:
+                hook = getattr(module, "_hf_hook", None)
+                if hook is not None:
+                    hook.offload = True
+        self._offload_restore.clear()
 
     @staticmethod
     def _infer_batch_size(batch: dict[str, torch.Tensor]) -> int:
