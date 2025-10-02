@@ -1,10 +1,12 @@
 import logging
+from contextlib import contextmanager, nullcontext
 from enum import Enum
 from typing import Dict, Iterable, List, Literal, Optional
 
 import torch
 import torch.nn.utils.parametrize as parametrize
 from compressed_tensors import match_modules_set, match_named_modules
+import compressed_tensors.transform.factory.base as transform_factory_base
 from compressed_tensors.transform import (
     TransformArgs,
     TransformConfig,
@@ -158,7 +160,7 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
     _stored_rotation_tensors: Dict[str, torch.Tensor] = PrivateAttr(
         default_factory=dict
     )
-    _offload_restore = PrivateAttr(default_factory=dict)
+    _offline_rotations_fused: bool = PrivateAttr(default=False)
 
     @field_validator("randomize", mode="before")
     def validate_not_implemented(cls, value, info: ValidationInfo):
@@ -226,11 +228,15 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         else:
             self._r3_block_size = None
 
+        if self.learn_rotations:
+            self._train_offline_rotations(state, head_dim)
+            self.learn_rotations = False
+
         config_groups = {}
-        if SpinquantRotation.R1 in self.rotations:
+        if SpinquantRotation.R1 in self.rotations and not self._offline_rotations_fused:
             config_groups["R1"] = self._create_r1_scheme()
 
-        if SpinquantRotation.R2 in self.rotations:
+        if SpinquantRotation.R2 in self.rotations and not self._offline_rotations_fused:
             config_groups["R2"] = self._create_r2_scheme(head_dim)
 
         if SpinquantRotation.R4 in self.rotations:
@@ -389,10 +395,10 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
     def _apply_transforms(self, model: PreTrainedModel) -> None:
         if self.transform_config is None:
             return
-        if self.learn_rotations:
-            self._temporarily_disable_offload(model)
-        self._prepare_rotation_keys(model)
-        apply_transform_config(model, self.transform_config)
+        context = self._allow_offload_training() if self.learn_rotations else nullcontext()
+        with context:
+            self._prepare_rotation_keys(model)
+            apply_transform_config(model, self.transform_config)
         self._attach_online_rotations(model)
 
     def _prepare_rotation_keys(self, model: PreTrainedModel) -> None:
@@ -593,7 +599,6 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         self._rotation_params.clear()
         self._parent_modules.clear()
         self._rotation_lookup.clear()
-        self._restore_offload(model)
 
     def _apply_cayley_updates(self) -> None:
         lr = self.cayley_lr
@@ -633,24 +638,35 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
                 for key, value in stored.items()
             }
 
-    def _temporarily_disable_offload(self, model: PreTrainedModel) -> None:
-        self._offload_restore.clear()
-        for module in model.modules():
-            hook = getattr(module, "_hf_hook", None)
-            if hook is not None and getattr(hook, "offload", False):
-                self._offload_restore[id(module)] = hook
-                hook.offload = False
-                hook.init_hook(module)
-
-    def _restore_offload(self, model: PreTrainedModel) -> None:
-        if not self._offload_restore:
+    def _train_offline_rotations(self, state: State, head_dim: int) -> None:
+        training_groups = {}
+        if SpinquantRotation.R1 in self.rotations:
+            training_groups["R1"] = self._create_r1_scheme()
+        if SpinquantRotation.R2 in self.rotations:
+            training_groups["R2"] = self._create_r2_scheme(head_dim)
+        if not training_groups:
             return
-        for module in model.modules():
-            hook = self._offload_restore.get(id(module))
-            if hook is not None:
-                hook.offload = True
-                hook.init_hook(module)
-        self._offload_restore.clear()
+
+        training_config = TransformConfig(config_groups=training_groups)
+        self.transform_config = training_config
+        self._prepare_rotation_keys(state.model)
+        apply_transform_config(state.model, training_config)
+        self._collect_rotation_structures(state.model)
+        self._run_cayley(state)
+        self._finalize_transforms(state.model)
+        self._offline_rotations_fused = True
+        self.transform_config = None
+
+
+    @contextmanager
+    def _allow_offload_training(self):
+        original = transform_factory_base.has_offloaded_params
+        transform_factory_base.has_offloaded_params = lambda _module: False
+        try:
+            yield
+        finally:
+            transform_factory_base.has_offloaded_params = original
+
 
     @staticmethod
     def _infer_batch_size(batch: dict[str, torch.Tensor]) -> int:
