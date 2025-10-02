@@ -59,9 +59,6 @@ def test_spinquant_learnable_cayley_updates_rotation():
     modifier._apply_transforms(model)
     modifier._collect_rotation_structures(model)
     parent_modules = list(modifier._parent_modules)
-    parent_modules = list(modifier._parent_modules)
-    parent_modules = list(modifier._parent_modules)
-    parent_modules = list(modifier._parent_modules)
 
     assert modifier._rotation_params, "Expected learnable rotation parameters"
 
@@ -125,3 +122,78 @@ def test_spinquant_learnable_r2_shares_rotation():
 
     for parent in parent_modules:
         assert not parametrize.is_parametrized(parent, "weight")
+
+
+def test_spinquant_stores_and_reloads_rotations():
+    model = _build_model()
+    dataset = _DummyDataset(model.config.vocab_size)
+    dataloader = DataLoader(dataset, batch_size=2)
+
+    trainer_modifier = SpinQuantModifier(
+        learn_rotations=True,
+        rotations=["R1", "R2"],
+        transform_type="spinquant-learnable",
+        cayley_iters=1,
+        cayley_lr=0.1,
+        cayley_samples=4,
+    )
+
+    state = State()
+    state.update(model=model, calib_data=dataloader)
+
+    assert trainer_modifier.on_initialize(state)
+    trainer_modifier._center_embeddings(model)
+    trainer_modifier._fuse_norms(model)
+    trainer_modifier._apply_transforms(model)
+    trainer_modifier._collect_rotation_structures(model)
+    trainer_modifier._run_cayley(state)
+    trainer_modifier._finalize_transforms(model)
+
+    assert trainer_modifier.stored_rotations
+    reference_weight = (
+        model.model.layers[0].self_attn.q_proj.weight.detach().clone()
+    )
+
+    reload_modifier = SpinQuantModifier(
+        rotations=["R1", "R2"],
+        transform_type="spinquant-learnable",
+        stored_rotations=trainer_modifier.stored_rotations,
+        stored_rotations_dtype=trainer_modifier.stored_rotations_dtype,
+    )
+
+    new_model = _build_model()
+    reload_state = State()
+    reload_state.update(model=new_model, calib_data=dataloader)
+
+    assert reload_modifier.on_initialize(reload_state)
+    reload_modifier._center_embeddings(new_model)
+    reload_modifier._fuse_norms(new_model)
+    reload_modifier._apply_transforms(new_model)
+    reload_modifier._finalize_transforms(new_model)
+
+    reloaded_weight = (
+        new_model.model.layers[0].self_attn.q_proj.weight.detach().clone()
+    )
+    assert torch.allclose(reference_weight, reloaded_weight, atol=1e-5, rtol=1e-4)
+
+
+def test_spinquant_r4_block_size_autopick():
+    config = LlamaConfig(
+        hidden_size=96,
+        intermediate_size=192,
+        num_attention_heads=4,
+        num_hidden_layers=1,
+        vocab_size=128,
+        max_position_embeddings=32,
+    )
+    model = LlamaForCausalLM(config)
+    dataset = _DummyDataset(model.config.vocab_size)
+    dataloader = DataLoader(dataset, batch_size=2)
+
+    modifier = SpinQuantModifier(rotations=["R4"], transform_type="hadamard")
+    state = State()
+    state.update(model=model, calib_data=dataloader)
+
+    assert modifier.on_initialize(state)
+    scheme = modifier.transform_config.config_groups["R4"]
+    assert scheme.head_dim == 32

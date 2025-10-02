@@ -94,6 +94,16 @@ class SpinQuantLearnableFactory(TransformFactory):
         exec_device = get_execution_device(module)
         precision = self.scheme.precision if args.is_online() else torch.float32
 
+        preload = getattr(module, "_spinquant_rotation_preload", None)
+        if isinstance(preload, dict) and key in preload:
+            data = preload.pop(key)
+            if not preload:
+                delattr(module, "_spinquant_rotation_preload")
+            data = data.to(device=device, dtype=precision)
+            rotation = Parameter(data.clone(), requires_grad=self.scheme.requires_grad)
+            self._rotations[key] = rotation
+            return rotation
+
         eye = torch.eye(size, dtype=precision, device=exec_device)
         eye = eye.to(device=device)
 

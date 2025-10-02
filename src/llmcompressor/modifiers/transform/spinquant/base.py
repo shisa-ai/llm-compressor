@@ -134,6 +134,12 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
     # optional override for more fine-grained control
     # also included in recipe serialization
     transform_config: Optional[TransformConfig] = Field(default=None, repr=False)
+    stored_rotations: Optional[Dict[str, List[List[float]]]] = Field(
+        default=None,
+        repr=False,
+        exclude=True,
+    )
+    stored_rotations_dtype: Optional[str] = Field(default=None, repr=False)
 
     _rotation_transforms: List[SpinQuantLearnableTransform] = PrivateAttr(
         default_factory=list
@@ -144,10 +150,14 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
     )
     _calib_loader = PrivateAttr(default=None)
     _parent_modules: List[torch.nn.Module] = PrivateAttr(default_factory=list)
+    _rotation_lookup: Dict[int, str] = PrivateAttr(default_factory=dict)
     _hidden_size: Optional[int] = PrivateAttr(default=None)
     _head_dim: Optional[int] = PrivateAttr(default=None)
     _r3_hooked: bool = PrivateAttr(default=False)
     _r3_block_size: Optional[int] = PrivateAttr(default=None)
+    _stored_rotation_tensors: Dict[str, torch.Tensor] = PrivateAttr(
+        default_factory=dict
+    )
 
     @field_validator("randomize", mode="before")
     def validate_not_implemented(cls, value, info: ValidationInfo):
@@ -181,6 +191,22 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
                 "Switching SpinQuant transform type to spinquant-learnable for training"
             )
             self.transform_type = "spinquant-learnable"
+
+        if self.stored_rotations:
+            dtype_name = self.stored_rotations_dtype
+            dtype = getattr(torch, dtype_name, None) if dtype_name else None
+            if dtype is None:
+                dtype = self.precision
+            self._stored_rotation_tensors = {
+                key: torch.tensor(value, dtype=dtype)
+                for key, value in self.stored_rotations.items()
+            }
+            if self.transform_type != "spinquant-learnable":
+                LOGGER.info(
+                    "Loading stored rotations with spinquant-learnable transforms"
+                )
+                self.transform_type = "spinquant-learnable"
+            self.learn_rotations = False
 
         head_dim = self._infer_head_dim(state.model)
         self._head_dim = head_dim
@@ -327,12 +353,16 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         )
 
     def _create_r4_scheme(self) -> TransformScheme:
+        if self._hidden_size is None:
+            raise ValueError("SpinQuant R4 requires hidden size to be known")
+        block = pick_block_size(self._hidden_size, self.transform_block_size)
+
         return TransformScheme(
             type=self.transform_type,
             randomize=self.randomize,
             requires_grad=self.learn_rotations,
             precision=self.precision,
-            head_dim=self.transform_block_size,
+            head_dim=block,
             apply=[
                 TransformArgs(
                     targets=[*self.mappings.mlp_out],
@@ -366,6 +396,13 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         if self.transform_type != "spinquant-learnable":
             return
 
+        preload = {}
+        if self._stored_rotation_tensors:
+            preload = {
+                key: tensor.to(dtype=self.precision)
+                for key, tensor in self._stored_rotation_tensors.items()
+            }
+
         if SpinquantRotation.R1 in self.rotations and self.r1_mode == "block":
             r1_targets = [
                 self.mappings.embedding,
@@ -381,7 +418,12 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
                 for name, module in match_named_modules(
                     model, [target], warn_on_fail=True
                 ):
-                    setattr(module, "_spinquant_rotation_key", f"R1_{name}")
+                    key = f"R1_{name}"
+                    setattr(module, "_spinquant_rotation_key", key)
+                    if key in preload:
+                        cache = getattr(module, "_spinquant_rotation_preload", {})
+                        cache[key] = preload[key].clone()
+                        setattr(module, "_spinquant_rotation_preload", cache)
 
         if SpinquantRotation.R2 in self.rotations:
             for attn_name, attn_module in match_named_modules(
@@ -393,6 +435,10 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
                         attn_module, [target], warn_on_fail=True
                     ):
                         setattr(module, "_spinquant_rotation_key", key)
+                        if key in preload:
+                            cache = getattr(module, "_spinquant_rotation_preload", {})
+                            cache[key] = preload[key].clone()
+                            setattr(module, "_spinquant_rotation_preload", cache)
 
     def _attach_online_rotations(self, model: PreTrainedModel) -> None:
         if self._r3_hooked:
@@ -436,6 +482,7 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         self._rotation_transforms.clear()
         self._rotation_params.clear()
         self._parent_modules.clear()
+        self._rotation_lookup.clear()
 
         parent_lookup = {}
         for parent in model.modules():
@@ -455,6 +502,7 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
             if id(rotation) not in seen:
                 self._rotation_params.append(rotation)
                 seen.add(id(rotation))
+                self._rotation_lookup[id(rotation)] = transform.rotation_key
 
     def _run_cayley(self, state: State) -> None:
         if not self._rotation_params:
@@ -522,6 +570,7 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
 
             batches_run += 1
 
+        self._cache_learned_rotations()
         for rotation in self._rotation_params:
             rotation.requires_grad_(False)
         for param, flag in self._original_requires_grad:
@@ -540,6 +589,7 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         self._rotation_transforms.clear()
         self._rotation_params.clear()
         self._parent_modules.clear()
+        self._rotation_lookup.clear()
 
     def _apply_cayley_updates(self) -> None:
         lr = self.cayley_lr
@@ -553,6 +603,31 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
                     continue
                 cayley_step_(rotation, grad, lr)
                 rotation.grad.zero_()
+
+    def _cache_learned_rotations(self) -> None:
+        if not self._rotation_params:
+            return
+
+        stored: Dict[str, List[List[float]]] = {}
+        dtype_name: Optional[str] = None
+        for rotation in self._rotation_params:
+            key = self._rotation_lookup.get(id(rotation))
+            if not key:
+                continue
+            tensor = rotation.detach().cpu()
+            stored[key] = tensor.tolist()
+            dtype_name = str(tensor.dtype).replace("torch.", "")
+
+        if stored:
+            self.stored_rotations = stored
+            self.stored_rotations_dtype = dtype_name
+            dtype = getattr(torch, dtype_name, None) if dtype_name else None
+            if dtype is None:
+                dtype = torch.float32
+            self._stored_rotation_tensors = {
+                key: torch.tensor(value, dtype=dtype)
+                for key, value in stored.items()
+            }
 
     @staticmethod
     def _infer_batch_size(batch: dict[str, torch.Tensor]) -> int:
