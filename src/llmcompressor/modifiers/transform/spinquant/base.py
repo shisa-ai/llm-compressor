@@ -158,7 +158,7 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
     _stored_rotation_tensors: Dict[str, torch.Tensor] = PrivateAttr(
         default_factory=dict
     )
-    _offload_restore: Dict[int, bool] = PrivateAttr(default_factory=dict)
+    _offload_restore = PrivateAttr(default_factory=dict)
 
     @field_validator("randomize", mode="before")
     def validate_not_implemented(cls, value, info: ValidationInfo):
@@ -638,17 +638,18 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         for module in model.modules():
             hook = getattr(module, "_hf_hook", None)
             if hook is not None and getattr(hook, "offload", False):
-                self._offload_restore[id(module)] = True
+                self._offload_restore[id(module)] = hook
                 hook.offload = False
+                hook.init_hook(module)
 
     def _restore_offload(self, model: PreTrainedModel) -> None:
         if not self._offload_restore:
             return
         for module in model.modules():
-            if id(module) in self._offload_restore:
-                hook = getattr(module, "_hf_hook", None)
-                if hook is not None:
-                    hook.offload = True
+            hook = self._offload_restore.get(id(module))
+            if hook is not None:
+                hook.offload = True
+                hook.init_hook(module)
         self._offload_restore.clear()
 
     @staticmethod
