@@ -5,7 +5,13 @@ from typing import Dict, Iterable, List, Literal, Optional
 
 import torch
 import torch.nn.utils.parametrize as parametrize
-from compressed_tensors import match_modules_set, match_named_modules
+from compressed_tensors import (
+    align_module_device,
+    match_modules_set,
+    match_named_modules,
+    remove_dispatch,
+    update_offload_parameter,
+)
 import compressed_tensors.transform.factory.base as transform_factory_base
 from compressed_tensors.transform import (
     TransformArgs,
@@ -18,7 +24,7 @@ from pydantic import Field, ValidationInfo, field_validator, PrivateAttr
 from transformers import PreTrainedModel
 
 from llmcompressor.core import Event, EventType, State
-from llmcompressor.modeling import center_embeddings, fuse_norm_linears
+from llmcompressor.modeling import center_embeddings
 from llmcompressor.modifiers import Modifier
 
 from .cayley import cayley_step_
@@ -27,10 +33,12 @@ from .learnable import SpinQuantLearnableTransform
 from .mappings import SpinQuantMapping, infer_mapping_from_model
 from .norm_mappings import NormMapping, infer_norm_mapping_from_model
 
+
+tqdm = None
 try:
     from tqdm.auto import tqdm
-except Exception:  # pragma: no cover - fallback if tqdm is unavailable
-    tqdm = None
+except Exception:  # pragma: no cover
+    pass
 
 
 LOGGER = logging.getLogger(__name__)
@@ -298,11 +306,41 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
             center_embeddings(embedding)
 
     def _fuse_norms(self, model: PreTrainedModel):
+        cpu = torch.device("cpu")
         for mapping in self.norm_mappings:
             for norm, *linears in match_modules_set(
                 model, (mapping.norm, *mapping.linears)
             ):
-                fuse_norm_linears(norm, linears)
+                self._fuse_norm_with_linears_cpu(norm, linears, cpu)
+
+    @staticmethod
+    def _fuse_norm_with_linears_cpu(
+        norm: torch.nn.Module,
+        linears: Iterable[torch.nn.Linear],
+        compute_device: torch.device,
+    ) -> None:
+        if not hasattr(norm, "weight"):
+            raise ValueError(f"Cannot fuse norm of type {type(norm)}")
+
+        for linear in linears:
+            weight_dtype = linear.weight.dtype
+            with align_module_device(norm, compute_device), align_module_device(
+                linear, compute_device
+            ):
+                norm_weight = norm.weight.to(device=compute_device, dtype=torch.float32)
+                fused_weight = linear.weight.to(device=compute_device, dtype=torch.float32)
+                fused_weight = fused_weight * norm_weight
+
+            update_offload_parameter(
+                linear,
+                "weight",
+                fused_weight.to(dtype=weight_dtype, device=compute_device),
+            )
+            del fused_weight
+
+        with align_module_device(norm, compute_device):
+            new_norm_weight = torch.ones_like(norm.weight, device=compute_device)
+        update_offload_parameter(norm, "weight", new_norm_weight)
 
     def _create_r1_scheme(self) -> TransformScheme:
         head_dim = None
@@ -424,7 +462,9 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
             module_names = set()
             heavy = False
             for transform_args in scheme.apply:
-                matches = list(match_named_modules(model, transform_args.targets, transform_args.ignore))
+                matches = list(
+                    match_named_modules(model, transform_args.targets, transform_args.ignore)
+                )
                 module_names.update(mod_name for mod_name, _ in matches)
                 if transform_args.location in ("weight_input", "weight_output"):
                     heavy = True
@@ -586,13 +626,13 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         if self.cayley_on_gpu:
             if not torch.cuda.is_available():
                 LOGGER.warning(
-                    "SpinQuant Cayley requested on GPU but CUDA is unavailable; "
-                    "falling back to CPU."
+                    "SpinQuant Cayley requested on GPU but CUDA is unavailable; falling back to CPU."
                 )
             else:
                 target_index = torch.cuda.current_device()
                 target_device = torch.device(f"cuda:{target_index}")
                 try:
+                    remove_dispatch(model)
                     LOGGER.info(
                         "Moving model to %s for SpinQuant Cayley optimization", target_device
                     )
@@ -604,8 +644,7 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
                     moved_to_gpu = True
                 except RuntimeError as err:
                     LOGGER.warning(
-                        "Failed to move model to GPU for Cayley optimization (%s); "
-                        "falling back to CPU.",
+                        "Failed to move model to GPU for Cayley optimization (%s); falling back to CPU.",
                         err,
                     )
                     model.to(original_device)
@@ -613,7 +652,6 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
                         with torch.no_grad():
                             rotation.data = rotation.data.to(original_device)
                     target_device = None
-                    moved_to_gpu = False
 
         iterator = iter(self._calib_loader)
         max_iters = max(self.cayley_iters, 1)
@@ -682,7 +720,6 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
                 batches_run += 1
                 if progress is not None:
                     progress.update(1)
-
         finally:
             if progress is not None:
                 progress.close()

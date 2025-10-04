@@ -98,7 +98,6 @@ class SpinQuantLearnableFactory(TransformFactory):
             and precision in {torch.float16, torch.bfloat16}
             and not torch.cuda.is_available()
         ):
-            # CPU kernels do not reliably support float16/bfloat16 math; fall back to fp32
             precision = torch.float32
 
         preload = getattr(module, "_spinquant_rotation_preload", None)
