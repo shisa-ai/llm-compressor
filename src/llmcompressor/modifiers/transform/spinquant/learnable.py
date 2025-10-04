@@ -92,7 +92,14 @@ class SpinQuantLearnableFactory(TransformFactory):
         size = get_transform_size(module, args.location, self.scheme.head_dim)
         device = get_offloaded_device(module)
         exec_device = get_execution_device(module)
-        precision = self.scheme.precision if args.is_online() else torch.float32
+        precision = self.scheme.precision
+        if (
+            not args.is_online()
+            and precision in {torch.float16, torch.bfloat16}
+            and not torch.cuda.is_available()
+        ):
+            # CPU kernels do not reliably support float16/bfloat16 math; fall back to fp32
+            precision = torch.float32
 
         preload = getattr(module, "_spinquant_rotation_preload", None)
         if isinstance(preload, dict) and key in preload:

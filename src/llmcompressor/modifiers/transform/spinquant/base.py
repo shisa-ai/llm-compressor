@@ -27,6 +27,11 @@ from .learnable import SpinQuantLearnableTransform
 from .mappings import SpinQuantMapping, infer_mapping_from_model
 from .norm_mappings import NormMapping, infer_norm_mapping_from_model
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - fallback if tqdm is unavailable
+    tqdm = None
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -89,6 +94,8 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
     :param cayley_lr: learning rate for Cayley-SGD
     :param cayley_samples: number of calibration samples to use for learning
     :param cayley_seed: random seed for rotation initialization
+    :param cayley_on_gpu: move the model to a single GPU during Cayley-SGD (requires
+        sufficient GPU memory to host the entire model)
     :param r1_mode: rotation layout for R1 ("global" or "block")
     :param r1_block_size: optional override for block size when r1_mode="block"
     :param enable_r3: attach online Hadamard to attention Q/K/KV cache paths
@@ -115,6 +122,7 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
     cayley_lr: float = Field(default=1.5)
     cayley_samples: int = Field(default=128)
     cayley_seed: int = Field(default=1234)
+    cayley_on_gpu: bool = Field(default=False)
     r1_mode: Literal["global", "block"] = Field(default="block")
     r1_block_size: Optional[int] = Field(default=None)
     enable_r3: bool = Field(default=False)
@@ -398,8 +406,47 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         context = self._allow_offload_training() if self.learn_rotations else nullcontext()
         with context:
             self._prepare_rotation_keys(model)
-            apply_transform_config(model, self.transform_config)
+            self._log_offline_rotation_summary(model)
+            apply_transform_config(model, self.transform_config, use_tqdm=True)
         self._attach_online_rotations(model)
+
+    def _log_offline_rotation_summary(
+        self,
+        model: PreTrainedModel,
+        config: Optional[TransformConfig] = None,
+    ) -> None:
+        config = config or self.transform_config
+        if config is None:
+            return
+
+        lines = []
+        for name, scheme in config.config_groups.items():
+            module_names = set()
+            heavy = False
+            for transform_args in scheme.apply:
+                matches = list(match_named_modules(model, transform_args.targets, transform_args.ignore))
+                module_names.update(mod_name for mod_name, _ in matches)
+                if transform_args.location in ("weight_input", "weight_output"):
+                    heavy = True
+
+            if not module_names:
+                continue
+
+            block = getattr(scheme, "head_dim", None)
+            block_desc = block if block is not None else "full"
+            stage_desc = "fusing weights" if heavy else "attaching hooks"
+            lines.append(
+                f"    - {name}: {stage_desc} for {len(module_names)} modules "
+                f"(block={block_desc}, type={scheme.type})"
+            )
+
+        if lines:
+            print(
+                "[INFO] SpinQuant: starting offline rotation fusion. "
+                "This step is CPU-bound and tqdm updates after each module."
+            )
+            for line in lines:
+                print(line)
 
     def _prepare_rotation_keys(self, model: PreTrainedModel) -> None:
         if self.transform_type != "spinquant-learnable":
@@ -533,6 +580,41 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         for rotation in self._rotation_params:
             rotation.requires_grad_(True)
 
+        moved_to_gpu = False
+        original_device = model_device
+        target_device = None
+        if self.cayley_on_gpu:
+            if not torch.cuda.is_available():
+                LOGGER.warning(
+                    "SpinQuant Cayley requested on GPU but CUDA is unavailable; "
+                    "falling back to CPU."
+                )
+            else:
+                target_index = torch.cuda.current_device()
+                target_device = torch.device(f"cuda:{target_index}")
+                try:
+                    LOGGER.info(
+                        "Moving model to %s for SpinQuant Cayley optimization", target_device
+                    )
+                    model.to(target_device)
+                    for rotation in self._rotation_params:
+                        with torch.no_grad():
+                            rotation.data = rotation.data.to(target_device)
+                    model_device = target_device
+                    moved_to_gpu = True
+                except RuntimeError as err:
+                    LOGGER.warning(
+                        "Failed to move model to GPU for Cayley optimization (%s); "
+                        "falling back to CPU.",
+                        err,
+                    )
+                    model.to(original_device)
+                    for rotation in self._rotation_params:
+                        with torch.no_grad():
+                            rotation.data = rotation.data.to(original_device)
+                    target_device = None
+                    moved_to_gpu = False
+
         iterator = iter(self._calib_loader)
         max_iters = max(self.cayley_iters, 1)
         samples_limit = self.cayley_samples if self.cayley_samples > 0 else None
@@ -542,42 +624,68 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         if self.cayley_seed is not None:
             torch.manual_seed(self.cayley_seed)
 
-        while batches_run < max_iters:
-            if samples_limit is not None and samples_seen >= samples_limit:
-                break
+        progress = None
+        if tqdm is not None and max_iters > 1:
+            progress = tqdm(
+                total=max_iters,
+                desc="Cayley optimization",
+                leave=False,
+            )
 
-            try:
-                batch = next(iterator)
-            except StopIteration:
-                iterator = iter(self._calib_loader)
-                batch = next(iterator)
+        try:
+            while batches_run < max_iters:
+                if samples_limit is not None and samples_seen >= samples_limit:
+                    break
 
-            batch = {
-                key: value.to(model_device)
-                for key, value in batch.items()
-                if isinstance(value, torch.Tensor)
-            }
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    iterator = iter(self._calib_loader)
+                    batch = next(iterator)
 
-            batch_size = self._infer_batch_size(batch)
-            samples_seen += batch_size
+                batch = {
+                    key: value.to(model_device)
+                    for key, value in batch.items()
+                    if isinstance(value, torch.Tensor)
+                }
 
-            model.zero_grad(set_to_none=True)
-            with torch.enable_grad():
-                outputs = model(**batch)
+                batch_size = self._infer_batch_size(batch)
+                samples_seen += batch_size
 
-                if not hasattr(outputs, "logits"):
-                    raise ValueError(
-                        "SpinQuant Cayley optimization expects model outputs with logits"
-                    )
+                model.zero_grad(set_to_none=True)
+                with torch.enable_grad():
+                    outputs = model(**batch)
 
-                logits = outputs.logits
-                quantized = self._ste_uniform_quant(logits)
-                loss = torch.nn.functional.mse_loss(quantized, logits.detach())
+                    if not hasattr(outputs, "logits"):
+                        raise ValueError(
+                            "SpinQuant Cayley optimization expects model outputs with logits"
+                        )
 
-            loss.backward()
-            self._apply_cayley_updates()
+                    logits = outputs.logits
+                    quantized = self._ste_uniform_quant(logits)
+                    loss = torch.nn.functional.mse_loss(quantized, logits.detach())
 
-            batches_run += 1
+                loss_value = float(loss.detach())
+                if progress is not None:
+                    progress.set_postfix(loss=f"{loss_value:.6f}")
+                LOGGER.info(
+                    "Cayley iteration %d/%d (device=%s): loss=%.6f",
+                    batches_run + 1,
+                    max_iters,
+                    model_device,
+                    loss_value,
+                )
+
+                loss.backward()
+                self._apply_cayley_updates()
+
+                batches_run += 1
+                if progress is not None:
+                    progress.update(1)
+
+        finally:
+            if progress is not None:
+                progress.close()
 
         self._cache_learned_rotations()
         for rotation in self._rotation_params:
@@ -585,6 +693,14 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         for param, flag in self._original_requires_grad:
             param.requires_grad_(flag)
         self._original_requires_grad.clear()
+
+        if moved_to_gpu:
+            LOGGER.info("Moving model back to CPU after Cayley optimization")
+            model.to(original_device)
+            for rotation in self._rotation_params:
+                with torch.no_grad():
+                    rotation.data = rotation.data.to(original_device)
+            torch.cuda.empty_cache()
 
     def _finalize_transforms(self, model: PreTrainedModel) -> None:
         if not self._rotation_transforms:
@@ -648,9 +764,21 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
             return
 
         training_config = TransformConfig(config_groups=training_groups)
+        self._log_offline_rotation_summary(state.model, training_config)
+        print(
+            "[INFO] SpinQuant: learning rotations with Cayley SGD "
+            f"(iters={self.cayley_iters}, samples={self.cayley_samples})."
+        )
+        if self.cayley_on_gpu:
+            print(
+                "[INFO] Cayley-SGD requested on GPU; the full model will be moved to a "
+                "single device during this step. Ensure the GPU has enough memory."
+            )
+        else:
+            print("[INFO] This optimization step runs on CPU before calibration begins.")
         self.transform_config = training_config
         self._prepare_rotation_keys(state.model)
-        apply_transform_config(state.model, training_config)
+        apply_transform_config(state.model, training_config, use_tqdm=True)
         self._collect_rotation_structures(state.model)
         self._run_cayley(state)
         self._finalize_transforms(state.model)

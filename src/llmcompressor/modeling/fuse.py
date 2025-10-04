@@ -1,16 +1,12 @@
 from typing import Iterable
 
 import torch
-from compressed_tensors import (
-    align_module_device,
-    get_execution_device,
-    update_offload_parameter,
-)
+from compressed_tensors import align_module_device, update_offload_parameter
 
 __all__ = ["center_embeddings", "fuse_norm_linears"]
 
 
-PRECISION = torch.float64
+PRECISION = torch.float32
 
 
 def center_embeddings(embedding: torch.nn.Module):
@@ -44,17 +40,24 @@ def fuse_norm_linears(norm: torch.nn.Module, linears: Iterable[torch.nn.Linear])
     if not hasattr(norm, "weight"):
         raise ValueError(f"Cannot fuse norm of type {type(norm)}")
 
+    compute_device = torch.device("cpu")
+
     for linear in linears:
-        # NOTE: spinquant does this op in float64
-        exec_device = get_execution_device(norm)
-        with align_module_device(norm, exec_device), align_module_device(
-            linear, exec_device
+        weight_dtype = linear.weight.dtype
+        with align_module_device(norm, compute_device), align_module_device(
+            linear, compute_device
         ):
-            weight_dtype = linear.weight.dtype
-            new_weight = linear.weight.to(PRECISION) * norm.weight.to(PRECISION)
-            new_weight = new_weight.to(weight_dtype)
+            norm_weight = norm.weight.to(device=compute_device, dtype=PRECISION)
+            fused_weight = linear.weight.to(device=compute_device, dtype=PRECISION)
+            fused_weight = fused_weight * norm_weight
 
-        update_offload_parameter(linear, "weight", new_weight)
+        update_offload_parameter(
+            linear,
+            "weight",
+            fused_weight.to(dtype=weight_dtype, device=compute_device),
+        )
+        del fused_weight
 
-    new_norm_weight = torch.ones_like(norm.weight, device="cpu")
+    with align_module_device(norm, compute_device):
+        new_norm_weight = torch.ones_like(norm.weight, device=compute_device)
     update_offload_parameter(norm, "weight", new_norm_weight)

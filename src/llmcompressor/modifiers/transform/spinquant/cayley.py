@@ -24,18 +24,32 @@ def cayley_update(R: torch.Tensor, G: torch.Tensor, lr: float) -> torch.Tensor:
     G_hat = _hat(G, R)
     Y = G_hat - G_hat.transpose(-1, -2)
 
-    eye = torch.eye(R.shape[-1], device=R.device, dtype=R.dtype)
-    A = eye - (lr / 2.0) * Y
-    B = eye + (lr / 2.0) * Y
-    BR = B @ R
-    return torch.linalg.solve(A, BR)
+    solve_dtype = R.dtype
+    if solve_dtype in (torch.float16, torch.bfloat16):
+        solve_dtype = torch.float32
+
+    R_cast = R.to(dtype=solve_dtype)
+    Y_cast = Y.to(dtype=solve_dtype)
+
+    eye = torch.eye(R.shape[-1], device=R.device, dtype=solve_dtype)
+    A = eye - (lr / 2.0) * Y_cast
+    B = eye + (lr / 2.0) * Y_cast
+    BR = B @ R_cast
+    updated = torch.linalg.solve(A, BR)
+    return updated.to(dtype=R.dtype)
 
 
 def enforce_orthonormal(R: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """Project a matrix back to the Stiefel manifold via SVD."""
 
-    U, _, Vh = torch.linalg.svd(R, full_matrices=False)
-    return (U @ Vh).to(dtype=R.dtype).clamp(min=-1.0 - eps, max=1.0 + eps)
+    svd_dtype = R.dtype
+    if svd_dtype in (torch.float16, torch.bfloat16):
+        svd_dtype = torch.float32
+
+    R_cast = R.to(dtype=svd_dtype)
+    U, _, Vh = torch.linalg.svd(R_cast, full_matrices=False)
+    projected = (U @ Vh).to(dtype=R.dtype)
+    return projected.clamp(min=-1.0 - eps, max=1.0 + eps)
 
 
 def cayley_step_(R: torch.Tensor, G: torch.Tensor, lr: float) -> None:
