@@ -1072,81 +1072,117 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         return logits[rows, last_idx]
 
 
-def _record_iteration_stats(
-    self,
-    iteration: int,
-    loss_value: float,
-    logits: torch.Tensor,
-    batch: dict[str, torch.Tensor],
-    lr: float,
-    batch_hash: Optional[str],
-    batch_hash_components: Optional[dict[str, str]],
-) -> None:
-    if self._debug_logit_dump_dir is None:
-        return
+    def _record_iteration_stats(
+        self,
+        iteration: int,
+        loss_value: float,
+        logits: torch.Tensor,
+        batch: dict[str, torch.Tensor],
+        lr: float,
+        batch_hash: Optional[str],
+        batch_hash_components: Optional[dict[str, str]],
+    ) -> None:
+        if self._debug_logit_dump_dir is None:
+            return
 
-    final_logits = self._extract_final_logits(logits, batch)
-    final_float = final_logits.detach().float()
-    entry: Dict[str, object] = {
-        "iteration": int(iteration),
-        "loss": float(loss_value),
-        "samples_seen": int(self._cayley_samples_seen),
-        "final_norm": float(final_float.norm().item()),
-        "final_mean": float(final_float.mean().item()),
-        "final_std": float(final_float.std(unbiased=False).item()),
-        "lr": float(lr),
-    }
+        final_logits = self._extract_final_logits(logits, batch)
+        final_float = final_logits.detach().float()
+        entry: Dict[str, object] = {
+            "iteration": int(iteration),
+            "loss": float(loss_value),
+            "samples_seen": int(self._cayley_samples_seen),
+            "final_norm": float(final_float.norm().item()),
+            "final_mean": float(final_float.mean().item()),
+            "final_std": float(final_float.std(unbiased=False).item()),
+            "lr": float(lr),
+        }
 
-    if batch_hash is not None:
-        entry["batch_hash"] = batch_hash
-    if batch_hash_components:
-        entry["batch_hash_components"] = dict(batch_hash_components)
+        if batch_hash is not None:
+            entry["batch_hash"] = batch_hash
+        if batch_hash_components:
+            entry["batch_hash_components"] = dict(batch_hash_components)
 
-    with torch.no_grad():
-        rotation_samples = []
-        for rotation in self._rotation_params[:2]:
-            key = self._rotation_lookup.get(id(rotation)) or "unknown"
-            rot_float = rotation.detach().float()
-            grad_norm = (
-                float(rotation.grad.detach().float().norm().item())
-                if rotation.grad is not None
-                else None
-            )
-            row_norm_dev = float(
-                torch.abs(rot_float.pow(2).sum(dim=1) - 1.0).max().item()
-            )
-            rotation_samples.append(
-                {
-                    "key": key,
-                    "norm": float(torch.linalg.vector_norm(rot_float).item()),
-                    "grad_norm": grad_norm,
-                    "row_norm_dev": row_norm_dev,
-                }
-            )
-        if rotation_samples:
-            entry["rotation_samples"] = rotation_samples
+        with torch.no_grad():
+            rotation_samples = []
+            for rotation in self._rotation_params[:2]:
+                key = self._rotation_lookup.get(id(rotation)) or "unknown"
+                rot_float = rotation.detach().float()
+                grad_norm = (
+                    float(rotation.grad.detach().float().norm().item())
+                    if rotation.grad is not None
+                    else None
+                )
+                row_norm_dev = float(
+                    torch.abs(rot_float.pow(2).sum(dim=1) - 1.0).max().item()
+                )
+                rotation_samples.append(
+                    {
+                        "key": key,
+                        "norm": float(torch.linalg.vector_norm(rot_float).item()),
+                        "grad_norm": grad_norm,
+                        "row_norm_dev": row_norm_dev,
+                    }
+                )
+            if rotation_samples:
+                entry["rotation_samples"] = rotation_samples
 
-        weight_samples = []
-        for module in self._parent_modules[:3]:
-            weight = getattr(module, "weight", None)
-            if weight is None:
-                continue
-            weight_float = weight.detach().float()
-            name = self._debug_module_names.get(id(module), module.__class__.__name__)
-            weight_samples.append(
-                {
-                    "name": name,
-                    "norm": float(weight_float.norm().item()),
-                    "mean": float(weight_float.mean().item()),
-                    "std": float(weight_float.std(unbiased=False).item()),
-                }
-            )
-        if weight_samples:
-            entry["weight_samples"] = weight_samples
+            weight_samples = []
+            for module in self._parent_modules[:3]:
+                weight = getattr(module, "weight", None)
+                if weight is None:
+                    continue
+                weight_float = weight.detach().float()
+                name = self._debug_module_names.get(id(module), module.__class__.__name__)
+                weight_samples.append(
+                    {
+                        "name": name,
+                        "norm": float(weight_float.norm().item()),
+                        "mean": float(weight_float.mean().item()),
+                        "std": float(weight_float.std(unbiased=False).item()),
+                    }
+                )
+            if weight_samples:
+                entry["weight_samples"] = weight_samples
 
-        entry["batch_tokens"] = int(batch.get("input_ids", torch.empty(0)).numel())
+            entry["batch_tokens"] = int(batch.get("input_ids", torch.empty(0)).numel())
 
         self._debug_iteration_logs.append(entry)
+
+    def _compute_task_loss(
+        self, logits: torch.Tensor, batch: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        input_ids = batch.get("input_ids")
+        if input_ids is None:
+            raise ValueError("SpinQuant Cayley optimization requires input_ids for task loss")
+
+        if logits.ndim != 3:
+            raise ValueError(
+                f"Expected logits with shape (batch, seq, vocab); got {tuple(logits.shape)}"
+            )
+
+        if logits.size(1) < 2:
+            raise ValueError("Sequences must contain at least two tokens for cross-entropy")
+
+        shift_logits = logits[..., :-1, :].contiguous().float()
+        shift_labels = input_ids[..., 1:].contiguous()
+
+        attention_mask = batch.get("attention_mask")
+        if attention_mask is not None:
+            mask = attention_mask[..., 1:].contiguous()
+            active = mask.reshape(-1) != 0
+            logits_flat = shift_logits.reshape(-1, shift_logits.size(-1))
+            labels_flat = shift_labels.reshape(-1)
+            if torch.any(active):
+                return torch.nn.functional.cross_entropy(
+                    logits_flat[active], labels_flat[active]
+                )
+            # Fallback to full loss if mask zeros out everything
+            return torch.nn.functional.cross_entropy(logits_flat, labels_flat)
+
+        return torch.nn.functional.cross_entropy(
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1),
+        )
 
     def _compute_task_loss(
         self, logits: torch.Tensor, batch: dict[str, torch.Tensor]
