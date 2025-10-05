@@ -3,7 +3,6 @@ from typing import Dict, Tuple
 import torch
 from compressed_tensors.utils import (
     align_module_device,
-    get_execution_device,
     update_offload_parameter,
 )
 from loguru import logger
@@ -17,6 +16,7 @@ from llmcompressor.modifiers.pruning.wanda.wanda_sparsify import (
     sparsify_weight,
 )
 from llmcompressor.utils.metric_logging import CompressionLogger
+from llmcompressor.utils.accelerate import get_execution_device
 
 __all__ = ["WandaPruningModifier"]
 

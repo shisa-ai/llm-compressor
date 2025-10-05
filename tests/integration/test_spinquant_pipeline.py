@@ -1,13 +1,17 @@
 import copy
 
+import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from llmcompressor.core import Event, EventType, State
+from llmcompressor.args.dataset_arguments import DatasetArguments
+from llmcompressor.core import Event, EventType, State, active_session
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.smoothquant import SmoothQuantModifier
 from llmcompressor.modifiers.transform.spinquant import SpinQuantModifier
+from llmcompressor.pipelines.registry import CalibrationPipeline
+from llmcompressor.recipe import Recipe
 
 
 class _ToyDataset(Dataset):
@@ -135,3 +139,91 @@ def test_spinquant_pipeline_kld_improves_over_smoothquant():
     assert smooth_kl > 0.0
     assert spin_kl > 0.0
     assert spin_kl <= smooth_kl + 1e-4
+
+
+def test_spinquant_cayley_gpu_breaks_sequential_pipeline_with_meta_error():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for GPU Cayley repro")
+
+    torch.manual_seed(1234)
+
+    session = active_session()
+    session.reset()
+
+    model = _build_model()
+    dataset = _ToyDataset(model.config.vocab_size, length=4, seq_len=32)
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=False)
+
+    modifiers = [
+        SpinQuantModifier(
+            rotations=["R1", "R2"],
+            learn_rotations=True,
+            transform_type="spinquant-learnable",
+            transform_block_size=8,
+            cayley_iters=1,
+            cayley_lr=0.2,
+            cayley_samples=4,
+            cayley_on_gpu=True,
+        ),
+        QuantizationModifier(
+            scheme={"W8A8": ["Linear"]},
+            ignore=["lm_head"],
+        ),
+    ]
+
+    recipe = Recipe.from_modifiers(modifiers)
+    session.initialize(
+        recipe=recipe,
+        model=model,
+        calib_data=dataloader,
+        copy_data=False,
+    )
+
+    dataset_args = DatasetArguments(
+        pipeline="sequential",
+        num_calibration_samples=len(dataset),
+        max_seq_length=dataset.seq_len,
+    )
+
+    pipeline = CalibrationPipeline.from_modifiers(
+        session.lifecycle.recipe.modifiers,
+        user=dataset_args.pipeline,
+    )
+
+    import transformers.masking_utils as masking_utils
+
+    meta_hits: list[str] = []
+    original_preprocess = masking_utils._preprocess_mask_arguments
+    recording_started = {"value": False}
+
+    def _record_meta(*args, **kwargs):
+        attention_mask = args[2]
+        cache_position = args[3]
+
+        if isinstance(attention_mask, torch.Tensor) and not attention_mask.is_meta:
+            recording_started["value"] = True
+
+        if recording_started["value"]:
+            if (
+                isinstance(attention_mask, torch.Tensor)
+                and attention_mask.is_meta
+                and attention_mask.ndim == 2
+            ):
+                meta_hits.append("attention_mask")
+            if (
+                isinstance(cache_position, torch.Tensor)
+                and cache_position.is_meta
+                and cache_position.ndim == 1
+            ):
+                meta_hits.append("cache_position")
+
+        return original_preprocess(*args, **kwargs)
+
+    masking_utils._preprocess_mask_arguments = _record_meta
+    try:
+        pipeline(model, dataloader, dataset_args)
+    finally:
+        masking_utils._preprocess_mask_arguments = original_preprocess
+        session.reset()
+
+    assert not meta_hits, meta_hits

@@ -8,9 +8,11 @@ import torch
 from compressed_tensors.transform import apply_transform_weight
 from compressed_tensors.transform.factory.base import TransformBase, TransformFactory
 from compressed_tensors.transform.factory.hadamard import get_transform_size
-from compressed_tensors.utils import get_execution_device, get_offloaded_device
+from compressed_tensors.utils import get_offloaded_device
 from torch import Tensor
 from torch.nn import Module, Parameter, Linear
+
+from llmcompressor.utils.accelerate import get_execution_device
 
 
 class SpinQuantLearnableTransform(TransformBase):

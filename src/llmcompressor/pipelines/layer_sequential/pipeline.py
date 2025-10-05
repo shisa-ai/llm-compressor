@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import tqdm
-from compressed_tensors.utils import disable_offloading, get_execution_device
+from compressed_tensors.utils import disable_offloading
 from torch.utils.data.dataloader import DataLoader
 
 from llmcompressor.core import LifecycleCallbacks, active_session
@@ -21,6 +21,7 @@ from llmcompressor.pipelines.sequential.helpers import (
     dispatch_for_sequential,
     get_sequential_targets,
 )
+from llmcompressor.utils.accelerate import get_execution_device
 from llmcompressor.utils.helpers import DisableQuantization, calibration_forward_context
 
 if TYPE_CHECKING:

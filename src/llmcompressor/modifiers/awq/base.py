@@ -5,7 +5,6 @@ import torch
 from compressed_tensors.quantization import disable_quantization
 from compressed_tensors.utils import (
     align_modules,
-    get_execution_device,
     match_named_modules,
     update_offload_parameter,
 )
@@ -28,6 +27,7 @@ from llmcompressor.pipelines.cache import IntermediatesCache
 from llmcompressor.utils.fsdp.helpers import get_fsdp_parent
 from llmcompressor.utils.helpers import calibration_forward_context
 from llmcompressor.utils.pytorch.module import get_layer_by_name
+from llmcompressor.utils.accelerate import get_execution_device
 
 __all__ = ["AWQModifier"]
 

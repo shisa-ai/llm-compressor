@@ -10,7 +10,6 @@ from compressed_tensors.quantization import (
 from compressed_tensors.quantization.quant_args import ActivationOrdering
 from compressed_tensors.utils import (
     align_module_device,
-    get_execution_device,
     getattr_chain,
     match_named_modules,
     update_offload_parameter,
@@ -28,6 +27,7 @@ from llmcompressor.modifiers.quantization.gptq.gptq_quantize import (
 from llmcompressor.modifiers.quantization.quantization import QuantizationMixin
 from llmcompressor.sentinel import Sentinel
 from llmcompressor.utils.metric_logging import CompressionLogger
+from llmcompressor.utils.accelerate import get_execution_device
 
 __all__ = ["GPTQModifier"]
 

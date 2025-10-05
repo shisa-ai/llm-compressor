@@ -1,6 +1,10 @@
+import hashlib
 import logging
+import os
 from contextlib import contextmanager, nullcontext
+from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Dict, Iterable, List, Literal, Optional
 
 import torch
@@ -128,10 +132,11 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
     learn_rotations: bool = Field(default=False)
     cayley_iters: int = Field(default=100)
     cayley_lr: float = Field(default=1.5)
+    cayley_lr_schedule: Literal["linear"] = Field(default="linear")
     cayley_samples: int = Field(default=128)
     cayley_seed: int = Field(default=1234)
     cayley_on_gpu: bool = Field(default=False)
-    cayley_loss_mode: Literal["quantized", "teacher"] = Field(default="teacher")
+    cayley_loss_mode: Literal["quantized", "teacher"] = Field(default="quantized")
     r1_mode: Literal["global", "block"] = Field(default="block")
     r1_block_size: Optional[int] = Field(default=None)
     enable_r3: bool = Field(default=False)
@@ -179,6 +184,23 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
     )
     _offline_rotations_fused: bool = PrivateAttr(default=False)
     _teacher_logits: List[torch.Tensor] = PrivateAttr(default_factory=list)
+    _teacher_batch_keys: List[str] = PrivateAttr(default_factory=list)
+    _teacher_cache_lookup: Dict[str, List[torch.Tensor]] = PrivateAttr(
+        default_factory=dict
+    )
+    _teacher_cache_hits: Dict[str, int] = PrivateAttr(default_factory=dict)
+    _debug_logit_dump_dir: Optional[Path] = PrivateAttr(default=None)
+    _debug_logit_file_prefix: str = PrivateAttr(default="spinquant")
+    _debug_logit_max_batches: int = PrivateAttr(default=0)
+    _cayley_batches_run: int = PrivateAttr(default=0)
+    _cayley_samples_seen: int = PrivateAttr(default=0)
+    _cayley_last_loss: Optional[float] = PrivateAttr(default=None)
+    _cayley_last_lr: Optional[float] = PrivateAttr(default=None)
+    _debug_teacher_cache: Optional[Dict[str, List[torch.Tensor]]] = PrivateAttr(
+        default=None
+    )
+    _debug_iteration_logs: List[dict] = PrivateAttr(default_factory=list)
+    _debug_module_names: Dict[int, str] = PrivateAttr(default_factory=dict)
 
     _TEACHER_CACHE_DTYPE = torch.bfloat16
 
@@ -201,6 +223,7 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         self.mappings = infer_mapping_from_model(state.model)
         self.norm_mappings = infer_norm_mapping_from_model(state.model)
         self._calib_loader = state.data.calib
+        self._configure_debug_logging()
         model_config = getattr(state.model, "config", None)
         self._hidden_size = getattr(model_config, "hidden_size", None)
 
@@ -345,6 +368,58 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         with align_module_device(norm, compute_device):
             new_norm_weight = torch.ones_like(norm.weight, device=compute_device)
         update_offload_parameter(norm, "weight", new_norm_weight)
+
+    def _configure_debug_logging(self) -> None:
+        if self._debug_logit_dump_dir is not None:
+            return
+
+        env_path = os.getenv("SPINQUANT_DEBUG_LOGITS")
+        if not env_path:
+            return
+
+        raw_path = Path(env_path).expanduser()
+        if raw_path.suffix:
+            dump_dir = raw_path.parent
+            prefix = raw_path.stem
+        else:
+            dump_dir = raw_path
+            prefix = "spinquant"
+
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        self._debug_logit_dump_dir = dump_dir
+        self._debug_logit_file_prefix = prefix
+
+        if LOGGER.getEffectiveLevel() > logging.INFO:
+            LOGGER.setLevel(logging.INFO)
+
+        max_batches_env = os.getenv("SPINQUANT_DEBUG_LOGITS_BATCHES")
+        if max_batches_env:
+            try:
+                self._debug_logit_max_batches = max(1, int(max_batches_env))
+            except ValueError:
+                LOGGER.warning(
+                    "Invalid value for SPINQUANT_DEBUG_LOGITS_BATCHES=%s; "
+                    "using default",
+                    max_batches_env,
+                )
+        if self._debug_logit_max_batches <= 0:
+            self._debug_logit_max_batches = 2
+
+        LOGGER.info(
+            "SpinQuant debug logit dump enabled (dir=%s, prefix=%s, batches=%d)",
+            self._debug_logit_dump_dir,
+            self._debug_logit_file_prefix,
+            self._debug_logit_max_batches,
+        )
+        self._debug_iteration_logs = []
+        self._debug_teacher_cache = None
+
+    def _ensure_debug_module_names(self, model: PreTrainedModel) -> None:
+        if self._debug_logit_dump_dir is None:
+            return
+        if self._debug_module_names:
+            return
+        self._debug_module_names = {id(module): name for name, module in model.named_modules()}
 
     def _create_r1_scheme(self) -> TransformScheme:
         head_dim = None
@@ -584,6 +659,9 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         self._parent_modules.clear()
         self._rotation_lookup.clear()
 
+        if self._debug_logit_dump_dir is not None:
+            self._ensure_debug_module_names(model)
+
         parent_lookup = {}
         for parent in model.modules():
             for child in parent.children():
@@ -616,8 +694,15 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         model_device = next(model.parameters()).device
         model.eval()
 
+        if self._debug_logit_dump_dir is not None:
+            self._debug_iteration_logs = []
+
+        self._cayley_batches_run = 0
+        self._cayley_samples_seen = 0
+        self._cayley_last_loss = None
+
         teacher_mode = self.cayley_loss_mode == "teacher"
-        if teacher_mode and not self._teacher_logits:
+        if teacher_mode and not self._teacher_cache_lookup:
             self._collect_teacher_logits(model)
 
         self._original_requires_grad = [
@@ -679,6 +764,7 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
             )
 
         teacher_index = 0
+        total_steps = max_iters
 
         try:
             while batches_run < max_iters:
@@ -691,16 +777,24 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
                     iterator = iter(self._calib_loader)
                     batch = next(iterator)
 
+                raw_batch = batch
+                batch_hash = None
+                hash_components = None
+                if teacher_mode or self._debug_logit_dump_dir is not None:
+                    batch_hash, hash_components = self._hash_batch_inputs(raw_batch)
+
                 batch = {
                     key: value.to(model_device)
-                    for key, value in batch.items()
+                    for key, value in raw_batch.items()
                     if isinstance(value, torch.Tensor)
                 }
 
                 batch_size = self._infer_batch_size(batch)
                 samples_seen += batch_size
+                self._cayley_samples_seen = samples_seen
 
                 model.zero_grad(set_to_none=True)
+                teacher_source = None
                 with torch.enable_grad():
                     outputs = model(**batch)
 
@@ -710,40 +804,79 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
                         )
 
                     logits = outputs.logits
+                    final_logits = self._extract_final_logits(logits, batch)
+                    teacher = None
                     if teacher_mode:
-                        final_logits = self._extract_final_logits(logits, batch)
-                        teacher = (
-                            self._teacher_logits[teacher_index % len(self._teacher_logits)]
-                            .to(final_logits.device, dtype=final_logits.dtype)
-                            .clone()
+                        if batch_hash is None:
+                            raise RuntimeError(
+                                "SpinQuant teacher loss requires batch hashing but none was computed"
+                            )
+                        teacher_cpu, teacher_source = self._resolve_teacher_tensor(
+                            batch_hash, teacher_index
                         )
                         teacher_index += 1
+                        if teacher_cpu is None:
+                            raise RuntimeError(
+                                "SpinQuant teacher cache is empty; cannot compute teacher loss"
+                            )
+                        teacher = teacher_cpu.to(
+                            final_logits.device, dtype=final_logits.dtype
+                        )
                         loss = torch.nn.functional.mse_loss(final_logits, teacher)
                     else:
+                        teacher_source = "disabled"
                         quantized = self._ste_uniform_quant(logits)
                         loss = torch.nn.functional.mse_loss(quantized, logits.detach())
 
                 loss_value = float(loss.detach())
+                step_index = batches_run
+                if total_steps <= 1:
+                    current_lr = self.cayley_lr
+                else:
+                    decay = 1.0 - (step_index / (total_steps - 1))
+                    current_lr = max(self.cayley_lr * decay, 0.0)
+
                 if progress is not None:
-                    progress.set_postfix(loss=f"{loss_value:.6f}")
+                    progress.set_postfix(
+                        loss=f"{loss_value:.6f}", lr=f"{current_lr:.4f}"
+                    )
                 LOGGER.info(
-                    "Cayley iteration %d/%d (device=%s): loss=%.6f",
+                    "Cayley iteration %d/%d (device=%s): loss=%.6f lr=%.6f",
                     batches_run + 1,
                     max_iters,
                     model_device,
                     loss_value,
+                    current_lr,
                 )
 
                 loss.backward()
-                self._apply_cayley_updates()
+                self._cayley_last_lr = current_lr
+                if self._debug_logit_dump_dir is not None:
+                    self._record_iteration_stats(
+                        iteration=batches_run + 1,
+                        loss_value=loss_value,
+                        final_logits=final_logits,
+                        teacher=teacher,
+                        logits=logits,
+                        batch=batch,
+                        batch_hash=batch_hash,
+                        teacher_source=teacher_source,
+                        batch_hash_components=hash_components,
+                        lr=current_lr,
+                    )
+                self._apply_cayley_updates(current_lr)
+
+                self._cayley_last_loss = loss_value
 
                 batches_run += 1
+                self._cayley_batches_run = batches_run
                 if progress is not None:
                     progress.update(1)
         finally:
             if progress is not None:
                 progress.close()
 
+        self._debug_dump_post_cayley_logits(model, stage="post_cayley_in_memory")
         self._cache_learned_rotations()
         for rotation in self._rotation_params:
             rotation.requires_grad_(False)
@@ -751,7 +884,7 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
             param.requires_grad_(flag)
         self._original_requires_grad.clear()
         if teacher_mode:
-            self._teacher_logits.clear()
+            self._reset_teacher_runtime_cache()
 
         if moved_to_gpu:
             LOGGER.info("Moving model back to CPU after Cayley optimization")
@@ -788,20 +921,18 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
                     continue
         if removed:
             LOGGER.debug("SpinQuant stripped %d lingering parametrizations", removed)
-        self._teacher_logits.clear()
+        self._debug_dump_post_cayley_logits(model, stage="post_finalize")
+        self._reset_teacher_runtime_cache()
 
-    def _apply_cayley_updates(self) -> None:
-        lr = self.cayley_lr
-        if lr <= 0:
-            return
-
+    def _apply_cayley_updates(self, lr: float) -> None:
         with torch.no_grad():
             for rotation in self._rotation_params:
                 grad = rotation.grad
                 if grad is None:
                     continue
-                cayley_step_(rotation, grad, lr)
-                rotation.grad.zero_()
+                if lr > 0:
+                    cayley_step_(rotation, grad, lr)
+                grad.zero_()
 
     def _cache_learned_rotations(self) -> None:
         if not self._rotation_params:
@@ -879,6 +1010,79 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
                 return value.shape[0]
         return 1
 
+    def _reset_teacher_runtime_cache(self) -> None:
+        self._teacher_logits.clear()
+        self._teacher_batch_keys.clear()
+        self._teacher_cache_lookup.clear()
+        self._teacher_cache_hits.clear()
+
+    @staticmethod
+    def _hash_tensor_contents(tensor: torch.Tensor) -> str:
+        tensor_cpu = tensor.detach().to("cpu", copy=True).contiguous()
+        hasher = hashlib.sha256()
+        hasher.update(str(tensor_cpu.shape).encode("utf-8"))
+        hasher.update(str(tensor_cpu.dtype).encode("utf-8"))
+        hasher.update(tensor_cpu.numpy().tobytes())
+        return hasher.hexdigest()
+
+    @staticmethod
+    def _hash_batch_inputs(batch: dict[str, torch.Tensor]) -> tuple[str, dict[str, str]]:
+        hasher = hashlib.sha256()
+        components: dict[str, str] = {}
+        for key in ("input_ids", "attention_mask"):
+            value = batch.get(key)
+            hasher.update(key.encode("utf-8"))
+            if value is None:
+                hasher.update(b"<none>")
+                components[key] = "<none>"
+                continue
+            component_hash = SpinQuantModifier._hash_tensor_contents(value)
+            components[key] = component_hash
+            hasher.update(component_hash.encode("utf-8"))
+        return hasher.hexdigest(), components
+
+    def _resolve_teacher_tensor(
+        self,
+        batch_hash: str,
+        fallback_index: int,
+    ) -> tuple[Optional[torch.Tensor], str]:
+        if not self._teacher_cache_lookup:
+            LOGGER.warning(
+                "SpinQuant teacher cache empty; falling back to sequential index %d",
+                fallback_index,
+            )
+            if not self._teacher_logits:
+                return None, "missing"
+            return (
+                self._teacher_logits[fallback_index % len(self._teacher_logits)],
+                "cache-empty",
+            )
+
+        cache_list = self._teacher_cache_lookup.get(batch_hash)
+        if cache_list:
+            hit_count = self._teacher_cache_hits.get(batch_hash, 0)
+            tensor = cache_list[hit_count % len(cache_list)]
+            self._teacher_cache_hits[batch_hash] = hit_count + 1
+            LOGGER.debug(
+                "SpinQuant teacher cache hit (hash=%s, hit=%d/%d)",
+                batch_hash,
+                hit_count + 1,
+                len(cache_list),
+            )
+            return tensor, "cache-hit"
+
+        LOGGER.warning(
+            "SpinQuant teacher cache miss for hash=%s; falling back to sequential index %d",
+            batch_hash,
+            fallback_index,
+        )
+        if not self._teacher_logits:
+            return None, "missing"
+        return (
+            self._teacher_logits[fallback_index % len(self._teacher_logits)],
+            "sequential-fallback",
+        )
+
     def _extract_final_logits(
         self, logits: torch.Tensor, batch: dict[str, torch.Tensor]
     ) -> torch.Tensor:
@@ -900,14 +1104,19 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
             raise ValueError("Teacher anchoring requires calibration data loader")
 
         device = next(model.parameters()).device
-        self._teacher_logits.clear()
+        self._reset_teacher_runtime_cache()
         model.eval()
 
+        debug_cache: Optional[Dict[str, List[torch.Tensor]]]
+        debug_cache = {} if self._debug_logit_dump_dir is not None else None
+
         with torch.inference_mode():
-            for batch in self._calib_loader:
+            for idx, raw_batch in enumerate(self._calib_loader):
+                batch_hash, hash_components = self._hash_batch_inputs(raw_batch)
+
                 batch = {
                     key: value.to(device)
-                    for key, value in batch.items()
+                    for key, value in raw_batch.items()
                     if isinstance(value, torch.Tensor)
                 }
                 outputs = model(**batch)
@@ -915,6 +1124,277 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
                 final_logits = self._extract_final_logits(logits, batch)
                 cached = final_logits.to(self._TEACHER_CACHE_DTYPE).cpu()
                 self._teacher_logits.append(cached)
+                self._teacher_batch_keys.append(batch_hash)
+                self._teacher_cache_lookup.setdefault(batch_hash, []).append(cached)
+                self._teacher_cache_hits.setdefault(batch_hash, 0)
+
+                input_tokens = raw_batch.get("input_ids")
+                mask_tokens = raw_batch.get("attention_mask")
+                token_count = int(input_tokens.numel()) if isinstance(input_tokens, torch.Tensor) else 0
+                mask_sum = (
+                    int(mask_tokens.sum().item())
+                    if isinstance(mask_tokens, torch.Tensor)
+                    else None
+                )
+                input_hash = hash_components.get("input_ids", "<none>")
+                mask_hash = hash_components.get("attention_mask", "<none>")
+                message = (
+                    "SpinQuant teacher cache add idx=%d hash=%s input_hash=%s "
+                    "mask_hash=%s tokens=%d mask_ones=%s"
+                    % (
+                        idx,
+                        batch_hash,
+                        input_hash,
+                        mask_hash,
+                        token_count,
+                        mask_sum if mask_sum is not None else "n/a",
+                    )
+                )
+                LOGGER.info(message)
+                print(message, flush=True)
+
+                if debug_cache is not None:
+                    debug_cache.setdefault(batch_hash, []).append(cached.clone())
+
+        if debug_cache is not None:
+            self._debug_teacher_cache = debug_cache
+        else:
+            self._debug_teacher_cache = None
+
+        if not self._teacher_logits:
+            LOGGER.warning("SpinQuant teacher cache collection yielded no batches")
+
+        summary_message = (
+            "SpinQuant teacher cache populated: batches=%d, unique_hashes=%d"
+            % (
+                len(self._teacher_logits),
+                len(self._teacher_cache_lookup),
+            )
+        )
+        LOGGER.info(summary_message)
+        print(summary_message, flush=True)
+
+    def _record_iteration_stats(
+        self,
+        iteration: int,
+        loss_value: float,
+        final_logits: torch.Tensor,
+        teacher: Optional[torch.Tensor],
+        logits: torch.Tensor,
+        batch: dict[str, torch.Tensor],
+        lr: float,
+        batch_hash: Optional[str],
+        teacher_source: Optional[str],
+        batch_hash_components: Optional[dict[str, str]],
+    ) -> None:
+        if self._debug_logit_dump_dir is None:
+            return
+
+        final_float = final_logits.detach().float()
+        entry: Dict[str, object] = {
+            "iteration": int(iteration),
+            "loss": float(loss_value),
+            "samples_seen": int(self._cayley_samples_seen),
+            "final_norm": float(final_float.norm().item()),
+            "final_mean": float(final_float.mean().item()),
+            "final_std": float(final_float.std(unbiased=False).item()),
+            "lr": float(lr),
+        }
+
+        if batch_hash is not None:
+            entry["batch_hash"] = batch_hash
+        if teacher_source is not None:
+            entry["teacher_source"] = teacher_source
+        if batch_hash_components:
+            entry["batch_hash_components"] = dict(batch_hash_components)
+
+        with torch.no_grad():
+            if teacher is not None:
+                teacher_float = teacher.detach().float()
+                entry["teacher_norm"] = float(teacher_float.norm().item())
+                entry["teacher_mse"] = float(
+                    torch.nn.functional.mse_loss(final_float, teacher_float).item()
+                )
+                entry["teacher_kl"] = float(
+                    torch.nn.functional.kl_div(
+                        final_float.log_softmax(dim=-1),
+                        teacher_float.softmax(dim=-1),
+                        reduction="batchmean",
+                    ).item()
+                )
+
+            rotation_samples = []
+            for rotation in self._rotation_params[:2]:
+                key = self._rotation_lookup.get(id(rotation)) or "unknown"
+                rot_float = rotation.detach().float()
+                grad_norm = (
+                    float(rotation.grad.detach().float().norm().item())
+                    if rotation.grad is not None
+                    else None
+                )
+                row_norm_dev = float(
+                    torch.abs(rot_float.pow(2).sum(dim=1) - 1.0).max().item()
+                )
+                rotation_samples.append(
+                    {
+                        "key": key,
+                        "norm": float(torch.linalg.vector_norm(rot_float).item()),
+                        "grad_norm": grad_norm,
+                        "row_norm_dev": row_norm_dev,
+                    }
+                )
+            if rotation_samples:
+                entry["rotation_samples"] = rotation_samples
+
+            weight_samples = []
+            for module in self._parent_modules[:3]:
+                weight = getattr(module, "weight", None)
+                if weight is None:
+                    continue
+                weight_float = weight.detach().float()
+                name = self._debug_module_names.get(id(module), module.__class__.__name__)
+                weight_samples.append(
+                    {
+                        "name": name,
+                        "norm": float(weight_float.norm().item()),
+                        "mean": float(weight_float.mean().item()),
+                        "std": float(weight_float.std(unbiased=False).item()),
+                    }
+                )
+            if weight_samples:
+                entry["weight_samples"] = weight_samples
+
+            entry["batch_tokens"] = int(batch.get("input_ids", torch.empty(0)).numel())
+
+        self._debug_iteration_logs.append(entry)
+
+    def _debug_dump_post_cayley_logits(
+        self, model: PreTrainedModel, stage: str
+    ) -> None:
+        if self._debug_logit_dump_dir is None:
+            return
+        if self._calib_loader is None:
+            LOGGER.warning(
+                "SpinQuant debug dump skipped: calibration loader unavailable"
+            )
+            return
+        if self._debug_logit_max_batches <= 0:
+            return
+
+        device = next(model.parameters()).device
+        teacher_cache = self._debug_teacher_cache or {}
+        batches: List[dict[str, object]] = []
+        max_batches = self._debug_logit_max_batches
+
+        with torch.inference_mode():
+            for batch_idx, raw_batch in enumerate(self._calib_loader):
+                if batch_idx >= max_batches:
+                    break
+
+                batch_hash, hash_components = self._hash_batch_inputs(raw_batch)
+                batch = {
+                    key: value.to(device)
+                    for key, value in raw_batch.items()
+                    if isinstance(value, torch.Tensor)
+                }
+
+                outputs = model(**batch)
+                logits = outputs.logits
+                final_logits = self._extract_final_logits(logits, batch)
+
+                stored_batch: dict[str, object] = {
+                    "batch_index": batch_idx,
+                    "final_logits": final_logits.to(torch.float32).cpu(),
+                    "batch_hash": batch_hash,
+                }
+                if hash_components:
+                    stored_batch["batch_hash_components"] = hash_components
+
+                for key in ("input_ids", "attention_mask"):
+                    tensor = batch.get(key)
+                    if tensor is not None:
+                        stored_batch[key] = tensor.cpu()
+
+                cache_list = teacher_cache.get(batch_hash) if teacher_cache else None
+                if cache_list:
+                    teacher_tensor = cache_list[0]
+                    if isinstance(teacher_tensor, torch.Tensor):
+                        stored_batch["teacher_final_logits"] = (
+                            teacher_tensor.to(torch.float32).cpu()
+                        )
+                elif teacher_cache:
+                    LOGGER.warning(
+                        "SpinQuant debug teacher cache miss for hash=%s during %s dump",
+                        batch_hash,
+                        stage,
+                    )
+
+                batches.append(stored_batch)
+
+        if not batches:
+            LOGGER.warning(
+                "SpinQuant debug dump produced no batches (max_batches=%d)",
+                max_batches,
+            )
+            return
+
+        norms = []
+        max_vals = []
+        min_vals = []
+        for entry in batches:
+            logits_tensor = entry["final_logits"].float()
+            norms.append(logits_tensor.norm(dim=-1))
+            max_vals.append(logits_tensor.max(dim=-1).values)
+            min_vals.append(logits_tensor.min(dim=-1).values)
+
+        stacked_norms = torch.cat(norms)
+        stacked_max = torch.cat(max_vals)
+        stacked_min = torch.cat(min_vals)
+
+        payload = {
+            "stage": stage,
+            "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
+            "device": str(device),
+            "model_dtype": str(next(model.parameters()).dtype),
+            "rotations": list(self.rotations),
+            "cayley": {
+                "iters_config": self.cayley_iters,
+                "lr": self.cayley_lr,
+                "lr_schedule": self.cayley_lr_schedule,
+                "samples_config": self.cayley_samples,
+                "loss_mode": self.cayley_loss_mode,
+                "batches_ran": self._cayley_batches_run,
+                "samples_seen": self._cayley_samples_seen,
+                "last_loss": self._cayley_last_loss,
+                "last_lr": self._cayley_last_lr,
+            },
+            "summary": {
+                "batch_count": len(batches),
+                "sample_count": int(sum(batch["final_logits"].shape[0] for batch in batches)),
+                "norm_mean": float(stacked_norms.mean()),
+                "norm_std": float(stacked_norms.std(unbiased=False)),
+                "max_mean": float(stacked_max.mean()),
+                "max_std": float(stacked_max.std(unbiased=False)),
+                "min_mean": float(stacked_min.mean()),
+                "min_std": float(stacked_min.std(unbiased=False)),
+            },
+            "batches": batches,
+            "iterations": list(self._debug_iteration_logs),
+        }
+
+        stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        filename = (
+            f"{self._debug_logit_file_prefix}_{stage}_{stamp}.pt"
+        )
+        path = self._debug_logit_dump_dir / filename
+        torch.save(payload, path)
+
+        LOGGER.info(
+            "SpinQuant debug logits dumped to %s (samples=%d, mean_norm=%.3f)",
+            path,
+            payload["summary"]["sample_count"],
+            payload["summary"]["norm_mean"],
+        )
 
     @staticmethod
     def _ste_uniform_quant(tensor: torch.Tensor, num_bits: int = 4) -> torch.Tensor:
