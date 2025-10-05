@@ -1184,42 +1184,6 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
             shift_labels.reshape(-1),
         )
 
-    def _compute_task_loss(
-        self, logits: torch.Tensor, batch: dict[str, torch.Tensor]
-    ) -> torch.Tensor:
-        input_ids = batch.get("input_ids")
-        if input_ids is None:
-            raise ValueError("SpinQuant Cayley optimization requires input_ids for task loss")
-
-        if logits.ndim != 3:
-            raise ValueError(
-                f"Expected logits with shape (batch, seq, vocab); got {tuple(logits.shape)}"
-            )
-
-        if logits.size(1) < 2:
-            raise ValueError("Sequences must contain at least two tokens for cross-entropy")
-
-        shift_logits = logits[..., :-1, :].contiguous().float()
-        shift_labels = input_ids[..., 1:].contiguous()
-
-        attention_mask = batch.get("attention_mask")
-        if attention_mask is not None:
-            mask = attention_mask[..., 1:].contiguous()
-            active = mask.reshape(-1) != 0
-            logits_flat = shift_logits.reshape(-1, shift_logits.size(-1))
-            labels_flat = shift_labels.reshape(-1)
-            if torch.any(active):
-                return torch.nn.functional.cross_entropy(
-                    logits_flat[active], labels_flat[active]
-                )
-            # Fallback to full loss if mask zeros out everything
-            return torch.nn.functional.cross_entropy(logits_flat, labels_flat)
-
-        return torch.nn.functional.cross_entropy(
-            shift_logits.reshape(-1, shift_logits.size(-1)),
-            shift_labels.reshape(-1),
-        )
-
     def _debug_dump_post_cayley_logits(
         self, model: PreTrainedModel, stage: str
     ) -> None:

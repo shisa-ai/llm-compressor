@@ -55,7 +55,9 @@ class SpinQuantLearnableTransform(TransformBase):
 
         # Apply activation quantization during Cayley training
         # This matches SpinQuant reference: ActQuantWrapper.forward() line 283-286
-        if self.cayley_quant_enabled and self.training:
+        # Note: We only check cayley_quant_enabled, not self.training, because
+        # transforms are not submodules and don't inherit training state from model.train()
+        if self.cayley_quant_enabled:
             rotated = fake_quantize_activation(
                 rotated, num_bits=self.cayley_quant_bits, enabled=True
             )
