@@ -131,6 +131,7 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
     cayley_samples: int = Field(default=128)
     cayley_seed: int = Field(default=1234)
     cayley_on_gpu: bool = Field(default=False)
+    cayley_loss_mode: Literal["quantized", "teacher"] = Field(default="teacher")
     r1_mode: Literal["global", "block"] = Field(default="block")
     r1_block_size: Optional[int] = Field(default=None)
     enable_r3: bool = Field(default=False)
@@ -177,6 +178,9 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         default_factory=dict
     )
     _offline_rotations_fused: bool = PrivateAttr(default=False)
+    _teacher_logits: List[torch.Tensor] = PrivateAttr(default_factory=list)
+
+    _TEACHER_CACHE_DTYPE = torch.bfloat16
 
     @field_validator("randomize", mode="before")
     def validate_not_implemented(cls, value, info: ValidationInfo):
@@ -612,6 +616,10 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         model_device = next(model.parameters()).device
         model.eval()
 
+        teacher_mode = self.cayley_loss_mode == "teacher"
+        if teacher_mode and not self._teacher_logits:
+            self._collect_teacher_logits(model)
+
         self._original_requires_grad = [
             (param, param.requires_grad) for param in model.parameters()
         ]
@@ -670,6 +678,8 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
                 leave=False,
             )
 
+        teacher_index = 0
+
         try:
             while batches_run < max_iters:
                 if samples_limit is not None and samples_seen >= samples_limit:
@@ -700,8 +710,18 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
                         )
 
                     logits = outputs.logits
-                    quantized = self._ste_uniform_quant(logits)
-                    loss = torch.nn.functional.mse_loss(quantized, logits.detach())
+                    if teacher_mode:
+                        final_logits = self._extract_final_logits(logits, batch)
+                        teacher = (
+                            self._teacher_logits[teacher_index % len(self._teacher_logits)]
+                            .to(final_logits.device, dtype=final_logits.dtype)
+                            .clone()
+                        )
+                        teacher_index += 1
+                        loss = torch.nn.functional.mse_loss(final_logits, teacher)
+                    else:
+                        quantized = self._ste_uniform_quant(logits)
+                        loss = torch.nn.functional.mse_loss(quantized, logits.detach())
 
                 loss_value = float(loss.detach())
                 if progress is not None:
@@ -730,6 +750,8 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         for param, flag in self._original_requires_grad:
             param.requires_grad_(flag)
         self._original_requires_grad.clear()
+        if teacher_mode:
+            self._teacher_logits.clear()
 
         if moved_to_gpu:
             LOGGER.info("Moving model back to CPU after Cayley optimization")
@@ -740,18 +762,33 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
             torch.cuda.empty_cache()
 
     def _finalize_transforms(self, model: PreTrainedModel) -> None:
-        if not self._rotation_transforms:
-            return
-        for module in self._parent_modules:
-            if parametrize.is_parametrized(module, "weight"):
-                parametrize.remove_parametrizations(
-                    module, "weight", leave_parametrized=True
-                )
+        if self._rotation_transforms:
+            for module in self._parent_modules:
+                if parametrize.is_parametrized(module, "weight"):
+                    parametrize.remove_parametrizations(
+                        module, "weight", leave_parametrized=True
+                    )
 
-        self._rotation_transforms.clear()
-        self._rotation_params.clear()
-        self._parent_modules.clear()
-        self._rotation_lookup.clear()
+            self._rotation_transforms.clear()
+            self._rotation_params.clear()
+            self._parent_modules.clear()
+            self._rotation_lookup.clear()
+
+        # Catch-all: ensure no parametrizations survive before GPTQ runs
+        removed = 0
+        for submodule in model.modules():
+            for name in ("weight", "bias"):
+                try:
+                    if parametrize.is_parametrized(submodule, name):
+                        parametrize.remove_parametrizations(
+                            submodule, name, leave_parametrized=True
+                        )
+                        removed += 1
+                except (ValueError, AttributeError, TypeError):
+                    continue
+        if removed:
+            LOGGER.debug("SpinQuant stripped %d lingering parametrizations", removed)
+        self._teacher_logits.clear()
 
     def _apply_cayley_updates(self) -> None:
         lr = self.cayley_lr
@@ -802,6 +839,8 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
 
         training_config = TransformConfig(config_groups=training_groups)
         self._log_offline_rotation_summary(state.model, training_config)
+        if self.cayley_loss_mode == "teacher":
+            self._collect_teacher_logits(state.model)
         print(
             "[INFO] SpinQuant: learning rotations with Cayley SGD "
             f"(iters={self.cayley_iters}, samples={self.cayley_samples})."
@@ -839,6 +878,43 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
             if isinstance(value, torch.Tensor) and value.ndim > 0:
                 return value.shape[0]
         return 1
+
+    def _extract_final_logits(
+        self, logits: torch.Tensor, batch: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        attention_mask = batch.get("attention_mask")
+        if attention_mask is not None:
+            last_idx = attention_mask.sum(dim=-1) - 1
+        else:
+            last_idx = torch.full(
+                (logits.size(0),),
+                logits.size(1) - 1,
+                device=logits.device,
+                dtype=torch.long,
+            )
+        rows = torch.arange(logits.size(0), device=logits.device)
+        return logits[rows, last_idx]
+
+    def _collect_teacher_logits(self, model: PreTrainedModel) -> None:
+        if self._calib_loader is None:
+            raise ValueError("Teacher anchoring requires calibration data loader")
+
+        device = next(model.parameters()).device
+        self._teacher_logits.clear()
+        model.eval()
+
+        with torch.inference_mode():
+            for batch in self._calib_loader:
+                batch = {
+                    key: value.to(device)
+                    for key, value in batch.items()
+                    if isinstance(value, torch.Tensor)
+                }
+                outputs = model(**batch)
+                logits = outputs.logits
+                final_logits = self._extract_final_logits(logits, batch)
+                cached = final_logits.to(self._TEACHER_CACHE_DTYPE).cpu()
+                self._teacher_logits.append(cached)
 
     @staticmethod
     def _ste_uniform_quant(tensor: torch.Tensor, num_bits: int = 4) -> torch.Tensor:
