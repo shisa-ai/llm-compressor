@@ -136,7 +136,7 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
     cayley_samples: int = Field(default=128)
     cayley_seed: int = Field(default=1234)
     cayley_on_gpu: bool = Field(default=False)
-    cayley_loss_mode: Literal["task"] = Field(default="task")
+    cayley_loss_mode: Literal["task", "teacher", "quantized"] = Field(default="task")
     r1_mode: Literal["global", "block"] = Field(default="block")
     r1_block_size: Optional[int] = Field(default=None)
     enable_r3: bool = Field(default=False)
@@ -203,6 +203,16 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
     def validate_rotations(cls, value):
         if isinstance(value, Iterable):
             return tuple(v.upper() for v in value)
+        return value
+
+    @field_validator("cayley_loss_mode", mode="before")
+    def normalize_loss_mode(cls, value):
+        if isinstance(value, str):
+            lowered = value.lower()
+            if lowered == "quantized":
+                return "task"
+            if lowered in {"task", "teacher"}:
+                return lowered
         return value
 
     def on_initialize(self, state: State, **kwargs) -> bool:
