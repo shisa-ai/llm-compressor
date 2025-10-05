@@ -36,6 +36,7 @@ from .hadamard_utils import block_hadamard_, pick_block_size
 from .learnable import SpinQuantLearnableTransform
 from .mappings import SpinQuantMapping, infer_mapping_from_model
 from .norm_mappings import NormMapping, infer_norm_mapping_from_model
+from .quantization import STEActivationQuantize
 
 
 tqdm = None
@@ -137,6 +138,7 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
     cayley_seed: int = Field(default=1234)
     cayley_on_gpu: bool = Field(default=False)
     cayley_loss_mode: Literal["task", "teacher", "quantized"] = Field(default="task")
+    cayley_act_bits: int = Field(default=4)
     r1_mode: Literal["global", "block"] = Field(default="block")
     r1_block_size: Optional[int] = Field(default=None)
     enable_r3: bool = Field(default=False)
@@ -708,6 +710,12 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         for rotation in self._rotation_params:
             rotation.requires_grad_(True)
 
+        # Enable activation quantization during Cayley training
+        # This ensures gradients flow through quantized activations (not weights)
+        # Matches SpinQuant paper Section 4.1: "activation quantized network"
+        self._enable_cayley_activation_quantization()
+        model.train()  # Enable training mode for fake quantization
+
         moved_to_gpu = False
         original_device = model_device
         target_device = None
@@ -846,6 +854,11 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
 
         self._debug_dump_post_cayley_logits(model, stage="post_cayley_in_memory")
         self._cache_learned_rotations()
+
+        # Disable activation quantization after Cayley training
+        self._disable_cayley_activation_quantization()
+        model.eval()  # Return to eval mode
+
         for rotation in self._rotation_params:
             rotation.requires_grad_(False)
         for param, flag in self._original_requires_grad:
@@ -888,6 +901,25 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
         if removed:
             LOGGER.debug("SpinQuant stripped %d lingering parametrizations", removed)
         self._debug_dump_post_cayley_logits(model, stage="post_finalize")
+
+    def _enable_cayley_activation_quantization(self) -> None:
+        """Enable activation quantization in transforms during Cayley training."""
+        for transform in self._rotation_transforms:
+            if hasattr(transform, "cayley_quant_enabled"):
+                transform.cayley_quant_enabled = True
+                transform.cayley_quant_bits = self.cayley_act_bits
+        LOGGER.debug(
+            "Enabled activation quantization in %d transforms (%d-bit)",
+            len(self._rotation_transforms),
+            self.cayley_act_bits,
+        )
+
+    def _disable_cayley_activation_quantization(self) -> None:
+        """Disable activation quantization in transforms after Cayley training."""
+        for transform in self._rotation_transforms:
+            if hasattr(transform, "cayley_quant_enabled"):
+                transform.cayley_quant_enabled = False
+        LOGGER.debug("Disabled activation quantization in transforms")
 
     def _apply_cayley_updates(self, lr: float) -> None:
         with torch.no_grad():

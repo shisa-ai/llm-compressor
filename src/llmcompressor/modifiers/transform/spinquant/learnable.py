@@ -13,6 +13,7 @@ from torch import Tensor
 from torch.nn import Module, Parameter, Linear
 
 from llmcompressor.utils.accelerate import get_execution_device
+from .quantization import fake_quantize_activation
 
 
 class SpinQuantLearnableTransform(TransformBase):
@@ -36,18 +37,30 @@ class SpinQuantLearnableTransform(TransformBase):
         self.scheme = scheme
         self.args = args
         self.module_type = module_type
+        # Activation quantization control (set during Cayley training)
+        self.cayley_quant_enabled = False
+        self.cayley_quant_bits = 4
 
     def forward(self, value: Tensor) -> Tensor:
         rotation = self.weight
         if self.inverse:
             rotation = rotation.transpose(-1, -2)
 
-        return apply_transform_weight(
+        rotated = apply_transform_weight(
             rotation.to(device=value.device),
             value.to(dtype=rotation.dtype),
             self.args.location,
             self.module_type,
-        ).to(value.dtype)
+        )
+
+        # Apply activation quantization during Cayley training
+        # This matches SpinQuant reference: ActQuantWrapper.forward() line 283-286
+        if self.cayley_quant_enabled and self.training:
+            rotated = fake_quantize_activation(
+                rotated, num_bits=self.cayley_quant_bits, enabled=True
+            )
+
+        return rotated.to(value.dtype)
 
 
 @TransformFactory.register("spinquant-learnable")
